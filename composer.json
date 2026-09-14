@@ -1,0 +1,65 @@
+{
+    "name": "nayvo/laravel-race-guard",
+    "description": "Detect race conditions in dirty Laravel code before committing.",
+    "type": "library",
+    "require": {
+        "php": "^8.2",
+        "illuminate/support": "^11.0 || ^12.0 || ^13.0",
+        "illuminate/console": "^11.0 || ^12.0 || ^13.0",
+        "nikic/php-parser": "^5.0",
+        "symfony/process": "^7.0 || ^8.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0 || ^10.0 || ^11.0",
+        "phpunit/phpunit": "^11.0 || ^12.0",
+        "laravel/pint": "^1.0",
+        "phpstan/phpstan": "^2.0"
+    },
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "Nayvo\\LaravelRaceGuard\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Nayvo\\LaravelRaceGuard\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Nayvo\\LaravelRaceGuard\\LaravelRaceGuardServiceProvider"
+            ]
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "scripts": {
+        "test": "phpunit",
+        "analyse": "phpstan analyse",
+        "format": "pint",
+        "lint": "pint --test",
+        "check": [
+            "@format",
+            "@analyse",
+            "@test"
+        ]
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "keywords": [
+        "laravel",
+        "race-condition",
+        "concurrency",
+        "static-analysis",
+        "php"
+    ],
+    "authors": [
+        {
+            "name": "Naveed",
+            "email": "naveedanjum42@gmail.com"
+        }
+    ]
+}
