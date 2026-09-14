@@ -58,4 +58,105 @@ final class UnsafeStateTransitionRuleTest extends AnalyzerTestCase
 
         $this->assertSame([], $findings);
     }
+
+    #[Test]
+    public function it_flags_an_instance_update_after_a_check_of_that_instance(): void
+    {
+        $findings = $this->analyze(
+            <<<'PHP'
+            $order = Order::find($id);
+            if ($order->status !== 'pending') {
+                return;
+            }
+            $order->update(['status' => 'processing']);
+            PHP,
+            new UnsafeStateTransitionRule,
+        );
+
+        $this->assertCount(1, $findings);
+    }
+
+    #[Test]
+    public function it_does_not_confuse_statuses_on_different_model_instances(): void
+    {
+        $findings = $this->analyze(
+            <<<'PHP'
+            if (! $rule->status) {
+                return;
+            }
+            $conversion = Conversion::create(['status' => 'pending']);
+            $conversion->update(['status' => 'failed']);
+            PHP,
+            new UnsafeStateTransitionRule,
+        );
+
+        $this->assertSame([], $findings);
+    }
+
+    #[Test]
+    public function it_does_not_confuse_a_status_query_on_another_model_with_an_instance_update(): void
+    {
+        $findings = $this->analyze(
+            <<<'PHP'
+            AuditLog::where('status', 'open')->first();
+            $conversion = Conversion::create(['status' => 'pending']);
+            $conversion->update(['status' => 'failed']);
+            PHP,
+            new UnsafeStateTransitionRule,
+        );
+
+        $this->assertSame([], $findings);
+    }
+
+    #[Test]
+    public function it_does_not_confuse_a_status_check_on_another_model_with_a_builder_update(): void
+    {
+        $findings = $this->analyze(
+            <<<'PHP'
+            $rule = Rule::find($id);
+            if (! $rule->status) {
+                return;
+            }
+            $conversion = Conversion::find($id);
+            Conversion::whereKey($id)->update(['status' => 'failed']);
+            PHP,
+            new UnsafeStateTransitionRule,
+        );
+
+        $this->assertSame([], $findings);
+    }
+
+    #[Test]
+    public function it_flags_a_builder_update_using_an_id_where_clause_for_the_checked_record(): void
+    {
+        $findings = $this->analyze(
+            <<<'PHP'
+            $order = Order::find($id);
+            if ($order->status !== 'pending') {
+                return;
+            }
+            Order::where('id', $id)->update(['status' => 'processing']);
+            PHP,
+            new UnsafeStateTransitionRule,
+        );
+
+        $this->assertCount(1, $findings);
+    }
+
+    #[Test]
+    public function it_does_not_treat_a_later_check_as_a_check_then_act_pattern(): void
+    {
+        $findings = $this->analyze(
+            <<<'PHP'
+            $order = Order::find($id);
+            $order->update(['status' => 'processing']);
+            if ($order->status === 'processing') {
+                return;
+            }
+            PHP,
+            new UnsafeStateTransitionRule,
+        );
+
+        $this->assertSame([], $findings);
+    }
 }
