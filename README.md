@@ -8,7 +8,7 @@ It focuses on changed Git files, allowing developers to catch concurrency issues
 php artisan race:check
 ```
 
-> **Status:** Laravel RaceGuard is currently under development. APIs, rules, and configuration may change before the first stable release.
+> **Status:** Laravel RaceGuard is under active development. It currently ships **13 rules (RG001–RG013)** across ten concurrency categories. APIs, rules, and configuration may still change before the first stable release.
 
 ## Why Laravel RaceGuard?
 
@@ -30,28 +30,50 @@ If two requests execute this code simultaneously, both requests may read the sam
 
 Laravel RaceGuard aims to detect patterns like this automatically.
 
-## Features
+## Rules
 
-Laravel RaceGuard is designed to detect common Laravel concurrency problems, including:
+Every finding carries a stable **RG code**, a **category**, a **severity**, and a **context-aware suggestion** tailored to the pattern (not a generic "use a transaction"). The full catalogue — with before/after examples and the recommended fix for each — lives in [`RULES.md`](RULES.md).
 
-- Read-modify-write operations
-- Check-then-act patterns
-- Check-then-create patterns
-- Non-atomic counters
-- Potential duplicate record creation
-- Missing database locks
-- Unsafe model state transitions
-- Unsafe balance and inventory updates
+| Code | Rule | Category | Severity |
+|------|------|----------|----------|
+| RG001 | Read-modify-write | database | High |
+| RG002 | Check-then-act | database | High |
+| RG003 | Check-then-create | database | High |
+| RG004 | Check-then-decrement (balances, stock, coins, quotas) | inventory | High |
+| RG005 | Unsafe status/state transition | database | High |
+| RG006 | Missing idempotency (queued external side effect) | idempotency | Medium |
+| RG007 | Transaction without lock | transactions | High |
+| RG008 | External side effect before commit | external | Medium |
+| RG009 | Duplicate job processing | queue | Medium |
+| RG010 | Missing database uniqueness (advisory) | idempotency | Low |
+| RG011 | Non-atomic counter (views, likes, attempts) | database | Medium |
+| RG012 | Guard-then-save | payments | High |
+| RG013 | Non-atomic cache read-modify-write | cache | Medium |
 
-RaceGuard also understands common safe Laravel patterns such as:
+Each rule can be toggled individually in `config/race-guard.php`.
 
-- `lockForUpdate()`
-- `increment()`
-- `decrement()`
+### Safe patterns RaceGuard recognises
+
+RaceGuard also understands common safe Laravel patterns and stays quiet on them:
+
+- `lockForUpdate()`, `sharedLock()`
+- `increment()` / `decrement()`
 - `Cache::lock()`
-- Atomic database updates
+- Atomic conditional updates (`->where('col', '>=', $n)->decrement(...)`)
+- `firstOrCreate()` / `updateOrCreate()` / `insertOrIgnore()`
+- `ShouldBeUnique` and the `WithoutOverlapping` middleware
+- `dispatch()->afterCommit()`
 
-> Not all rules listed above may be available in early development versions.
+## Categories
+
+Findings are grouped into ten concurrency domains:
+
+```text
+payments   inventory   database   transactions   locks
+idempotency   queue   scheduler   cache   external
+```
+
+You can report only the categories you care about with `--category` (repeatable).
 
 ## Requirements
 
@@ -67,7 +89,7 @@ Laravel RaceGuard is intended to support:
 Install Laravel RaceGuard using Composer:
 
 ```bash
-composer require nayvo/laravel-race-guard --dev
+composer require nayvocode/laravel-race-logic-guard --dev
 ```
 
 The `--dev` flag is recommended because RaceGuard is a development/static-analysis tool and normally does not need to be installed in production.
@@ -82,7 +104,20 @@ Check the current Git changes for potential race conditions:
 php artisan race:check
 ```
 
-RaceGuard analyzes modified PHP files and reports suspicious concurrency patterns.
+By default RaceGuard scans the **whole of each changed file**. Common variants:
+
+```bash
+php artisan race:check                       # Git-aware scan of changed files
+php artisan race:check --path=app/Services   # scan specific files or directories
+php artisan race:check --all                 # scan the configured paths in full
+php artisan race:check --staged              # only files staged for commit
+php artisan race:check --changed-lines       # only report on changed lines
+php artisan race:check --category=payments   # filter by category (repeatable)
+php artisan race:check --severity=high       # only High and above
+php artisan race:check --format=json         # machine-readable output for CI
+```
+
+RaceGuard analyzes the modified PHP files and reports suspicious concurrency patterns, grouped by category and tagged with their RG code.
 
 Example:
 
@@ -90,22 +125,25 @@ Example:
 Laravel RaceGuard
 ────────────────────────────────────────
 
-Scanning changed PHP files...
+Scanned 1 changed PHP file...
 
-HIGH
+DATABASE
+
+RG001  HIGH
 app/Services/WalletService.php:42
 
 Potential read-modify-write race condition.
 
-$user->balance = $user->balance - $amount;
-$user->save();
+    $user->balance = $user->balance - $amount;
+    $user->save();
 
-The value is read and subsequently written without an
-atomic operation or database lock.
+The value of $user->balance is read and subsequently written
+without an atomic operation or database lock.
 
 Suggestion:
-Use an atomic database operation or lock the row before
-performing the update.
+Use an atomic database update, e.g.
+Model::whereKey($id)->decrement('balance', $amount), or lock the
+row with lockForUpdate() inside a transaction before updating.
 
 ────────────────────────────────────────
 
@@ -114,9 +152,9 @@ performing the update.
 
 ## What RaceGuard Checks
 
-RaceGuard focuses on patterns where concurrent execution could cause unexpected application state.
+RaceGuard focuses on patterns where concurrent execution could cause unexpected application state. A few representative examples follow; see [`RULES.md`](RULES.md) for the complete list.
 
-### Read-Modify-Write
+### Read-Modify-Write (RG001)
 
 Potentially unsafe:
 
@@ -136,71 +174,56 @@ A safer approach may be:
 User::whereKey($userId)->decrement('balance', $amount);
 ```
 
-The correct solution depends on the surrounding business logic.
+### Check-Then-Decrement (RG004)
 
-### Check-Then-Act
-
-Potentially unsafe:
+Potentially unsafe — the sufficiency check and the debit are separate steps:
 
 ```php
-$order = Order::find($orderId);
+$wallet = PlayerCoin::where('player_id', $id)->first();
 
-if ($order->status === 'pending') {
-    $order->status = 'processing';
-    $order->save();
+if (! $wallet || $wallet->coins < $amount) {
+    abort(422);
+}
 
-    // Process order...
+$wallet->decrement('coins', $amount); // atomic, but the check was stale
+```
+
+A safer approach makes the check and the debit one atomic statement:
+
+```php
+$debited = PlayerCoin::where('player_id', $id)
+    ->where('coins', '>=', $amount)
+    ->decrement('coins', $amount);
+
+if ($debited === 0) {
+    abort(422); // insufficient — checked atomically
 }
 ```
 
-Multiple workers could observe the order in the `pending` state before either worker changes it.
+### Transaction Without Lock (RG007)
 
-Depending on the operation, a database transaction with a row lock may be appropriate:
+A transaction alone does not prevent two requests from reading the same row and overwriting each other on the default isolation level. Lock the row inside the transaction:
 
 ```php
-DB::transaction(function () use ($orderId) {
-    $order = Order::whereKey($orderId)
-        ->lockForUpdate()
-        ->firstOrFail();
+DB::transaction(function () use ($id, $amount) {
+    $wallet = Wallet::whereKey($id)->lockForUpdate()->firstOrFail();
 
-    if ($order->status === 'pending') {
-        $order->status = 'processing';
-        $order->save();
-
-        // Process order...
-    }
+    $wallet->balance -= $amount;
+    $wallet->save();
 });
 ```
 
-### Check-Then-Create
+### External Side Effect Before Commit (RG008)
 
-Potentially unsafe:
-
-```php
-if (!Order::where('reference', $reference)->exists()) {
-    Order::create([
-        'reference' => $reference,
-    ]);
-}
-```
-
-Two requests could both determine that the record does not exist and then both create it.
-
-For uniqueness requirements, a database unique constraint should normally be the final line of defense.
-
-### Non-Atomic Counters
-
-Potentially unsafe:
+An HTTP call, mail, notification or job dispatch inside a transaction runs before it commits — on rollback it cannot be undone, and a dispatched job may start before its data is committed. Defer it:
 
 ```php
-$post->views = $post->views + 1;
-$post->save();
-```
+DB::transaction(function () use ($order) {
+    $order->update(['status' => 'paid']);
+});
 
-A safer atomic operation is:
-
-```php
-$post->increment('views');
+// after the transaction commits
+Http::post('https://gateway/charge', [...]);
 ```
 
 ## Git-Aware Analysis
@@ -213,6 +236,8 @@ It can inspect:
 - Staged files
 - Unstaged files
 - New/untracked PHP files
+
+By default a changed file is analysed **in full** (`diff_granularity => 'file'`). Pass `--changed-lines` (or set the config to `'lines'`) to restrict findings to the exact lines in your diff.
 
 This prevents developers from being overwhelmed by unrelated warnings from existing code.
 
@@ -290,20 +315,47 @@ return [
 
     'paths' => [
         'app',
+        // 'modules', // add if your business logic lives outside app/
     ],
 
     'exclude' => [
         'vendor',
         'storage',
         'bootstrap/cache',
+        'node_modules',
     ],
 
+    // Findings below this severity are hidden.
     'minimum_severity' => 'medium',
+
+    // Exit non-zero when a finding of at least this severity is present.
+    'fail_on' => 'high',
+
+    // 'file' scans the whole changed file; 'lines' narrows to changed lines.
+    'diff_granularity' => 'file',
+
+    // Which Git changes to inspect: 'dirty', 'staged' or 'unstaged'.
+    'git_scope' => 'dirty',
+
+    // Toggle individual rules (RG001–RG013) on or off.
+    'rules' => [
+        'read_modify_write' => true,
+        'check_then_act' => true,
+        'check_then_create' => true,
+        'unsafe_balance_update' => true,
+        'unsafe_state_transition' => true,
+        'missing_idempotency' => true,
+        'transaction_without_lock' => true,
+        'external_side_effect_before_commit' => true,
+        'overlapping_job' => true,
+        'missing_database_uniqueness' => true,
+        'non_atomic_counter' => true,
+        'guard_then_save' => true,
+        'non_atomic_cache' => true,
+    ],
 
 ];
 ```
-
-Configuration options may expand as RaceGuard develops.
 
 ## Git Pre-Commit Hook
 
@@ -315,45 +367,19 @@ For example:
 php artisan race:check
 ```
 
-can be executed before allowing a commit.
+can be executed before allowing a commit. The command exits non-zero when a finding of at least `fail_on` severity is present, so it can block a commit or fail CI.
 
 A future version may provide automatic Git hook installation.
 
-Example workflow:
-
-```text
-git commit
-     ↓
-Laravel RaceGuard
-     ↓
-Potential race found?
-     │
-   YES ──→ Stop / review
-     │
-    NO
-     ↓
-Commit
-```
-
 ## CI/CD
 
-RaceGuard is also intended for CI pipelines.
-
-For example:
-
-```bash
-php artisan race:check
-```
-
-can be run during GitHub Actions, GitLab CI, Bitbucket Pipelines, or another CI/CD workflow.
-
-Future versions may support machine-readable output such as:
+RaceGuard is also intended for CI pipelines and supports machine-readable JSON:
 
 ```bash
 php artisan race:check --format=json
 ```
 
-for integration with automated code-review systems.
+The package ships a GitHub Actions workflow (`.github/workflows/run-tests.yml`) that runs the test suite and static analysis across PHP 8.2–8.4 and Laravel 11–12, and the same `race:check` command can run in GitHub Actions, GitLab CI, Bitbucket Pipelines, or another CI/CD workflow.
 
 ## Philosophy
 
@@ -388,25 +414,34 @@ RaceGuard should therefore be used as an additional development safeguard, not a
 
 ## Roadmap
 
-Planned functionality includes:
+Implemented:
 
-- [ ] Git dirty-file detection
-- [ ] Changed-line detection
-- [ ] PHP AST parsing
-- [ ] Read-modify-write detection
-- [ ] Check-then-act detection
-- [ ] Check-then-create detection
-- [ ] Counter race detection
-- [ ] Laravel transaction awareness
-- [ ] `lockForUpdate()` awareness
-- [ ] Atomic update awareness
-- [ ] Laravel cache lock awareness
-- [ ] Queue concurrency analysis
-- [ ] Configurable rules
-- [ ] Severity levels
-- [ ] JSON output
-- [ ] Git pre-commit integration
-- [ ] GitHub Actions integration
+- [x] Git dirty-file detection
+- [x] Changed-line detection
+- [x] PHP AST parsing
+- [x] Read-modify-write detection
+- [x] Check-then-act detection
+- [x] Check-then-create detection
+- [x] Counter race detection
+- [x] Laravel transaction awareness
+- [x] `lockForUpdate()` awareness
+- [x] Atomic update awareness
+- [x] Laravel cache lock awareness
+- [x] Configurable rules
+- [x] Severity levels
+- [x] Rule codes and categories
+- [x] Category filtering (`--category`)
+- [x] JSON output
+- [x] GitHub Actions integration
+
+Planned (see [`RULES.md`](RULES.md) for the full, categorized roadmap):
+
+- [ ] Deeper queue concurrency analysis
+- [ ] Lock-scope rules (lock-after-read, wrong-row lock, write outside the locked transaction)
+- [ ] Scheduler overlap (`withoutOverlapping()`)
+- [ ] Stale-model / lost-update detection and optimistic-locking hints
+- [ ] Webhook / payment idempotency and outbox-pattern candidates
+- [ ] Git pre-commit hook installation
 - [ ] Custom user-defined rules
 
 ## Development
@@ -414,8 +449,8 @@ Planned functionality includes:
 Clone the repository:
 
 ```bash
-git clone https://github.com/nayvo/laravel-race-guard.git
-cd laravel-race-guard
+git clone https://github.com/nayvocode/laravel-race-logic-guard.git
+cd laravel-race-logic-guard
 ```
 
 Install dependencies:
@@ -424,22 +459,14 @@ Install dependencies:
 composer install
 ```
 
-Run tests:
+Run the checks (Composer scripts are provided):
 
 ```bash
-vendor/bin/phpunit
-```
-
-Run static analysis:
-
-```bash
-vendor/bin/phpstan analyse
-```
-
-Run code formatting:
-
-```bash
-vendor/bin/pint
+composer test      # phpunit
+composer analyse   # phpstan
+composer format    # pint (fix)
+composer lint      # pint (check only)
+composer check     # format + analyse + test
 ```
 
 ## Testing in a Local Laravel Application
@@ -452,7 +479,7 @@ Add the following to the Laravel application's `composer.json`:
 "repositories": [
     {
         "type": "path",
-        "url": "../laravel-race-guard",
+        "url": "../laravel-race-logic-guard",
         "options": {
             "symlink": true
         }
@@ -463,7 +490,7 @@ Add the following to the Laravel application's `composer.json`:
 Then run:
 
 ```bash
-composer require nayvo/laravel-race-guard:@dev --dev
+composer require nayvocode/laravel-race-logic-guard:@dev --dev
 ```
 
 Composer can symlink the local package into the Laravel application's `vendor` directory, allowing package changes to be tested without publishing a new release.
